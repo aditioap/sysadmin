@@ -1,0 +1,173 @@
+pipeline {
+    agent {
+        node {
+            label "${params.NODE_LABELS}"
+        }
+    }
+
+    parameters {
+        string(name: 'NODE_LABELS', defaultValue: '', description: 'Enter the node label to use (FINAPP-MCF or FINAPP-MAF)')
+    }
+
+    environment {
+        DOTNET_CLI_HOME = "C:\\Program Files\\dotnet"
+    }
+
+    stages {
+        stage('Set COMPANY_ID_ENVIRONMENT and COMPANY_NAME_ENVIRONMENT') {
+            steps {
+                script {
+                    def nodeLabels = params.NODE_LABELS
+                    echo "NODE_LABELS passed to pipeline: ${nodeLabels}"
+
+                    // Set local variables to store the company data
+                    def companyId = ''
+                    def companyName = ''
+                    def domainEndpoint = ''
+
+                    // Check the node label and set values
+                    if (nodeLabels.contains("FINAPP-MCF")) {
+                        companyId = '3'
+                        companyName = 'MEGA CENTRAL FINANCE'
+                        domainEndpoint = 'http://btk-api-r4-fincore.mcf.co.id'
+                    } else if (nodeLabels.contains("FINAPP-MAF")) {
+                        companyId = '2'
+                        companyName = 'MEGA AUTO FINANCE'
+                        domainEndpoint = 'http://btk-api-r4-fincore.maf.co.id'
+                    }
+
+                    // Print out the values of companyId and companyName
+                    echo "companyId is set to: ${companyId}"
+                    echo "companyName is set to: ${companyName}"
+                    echo "domainEndpoint is set to: ${domainEndpoint}"                    
+
+                    // Store the values in the current build to pass to other stages
+                    currentBuild.description = "COMPANY_ID_ENVIRONMENT=${companyId}, COMPANY_NAME_ENVIRONMENT=${companyName}, DOMAIN_ENDPOINT_ENVIRONMENT=${domainEndpoint}"
+                }
+            }
+        }
+
+        stage('Check Branch') {
+            when {
+                branch "Production-R4-app"
+            }
+            steps {
+                script {
+                    bat "dotnet --version"
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                script {
+                    bat "dotnet restore"
+                    bat "dotnet build --configuration Release"
+                }
+            }
+        }
+
+        stage('Test') {
+            steps {
+                script {
+                    bat "dotnet test --no-restore --configuration Release"
+                }
+            }
+        }
+
+        stage('Publish') {
+            steps {
+                script {
+                    powershell """
+                    If (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+                        throw "This script must be run as an Administrator."
+                    }            
+
+                    Import-Module -Name WebAdministration
+
+                    \$iisSiteName = "FINAPP-*_R4"
+                    Stop-Website -Name \$iisSiteName
+                    Stop-WebAppPool -Name \$iisSiteName
+                    
+                    Write-Host "Website \$iisSiteName stopped"
+                    """
+                    bat "dotnet publish --no-restore --configuration Release --output D:\\Publish\\Fincore-R4_66"
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                script {
+                    // Retrieve the values passed from the previous stage
+                    def companyIdEnv = currentBuild.description.split(",")[0].split("=")[1]
+                    def companyNameEnv = currentBuild.description.split(",")[1].split("=")[1]
+                    def domainEndpointEnv = currentBuild.description.split(",")[2].split("=")[1]                    
+
+                    echo "Deploying with COMPANY_ID_ENVIRONMENT=${companyIdEnv}, COMPANY_NAME_ENVIRONMENT=${companyNameEnv}, DOMAIN_ENDPOINT_ENVIRONMENT=${domainEndpointEnv}"
+
+                    withCredentials([usernamePassword(credentialsId: 'svr.jenkins', passwordVariable: 'CREDENTIAL_PASSWORD', usernameVariable: 'CREDENTIAL_USERNAME')]) {
+                        powershell """
+                        # Ensure running with administrative privileges
+                        If (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+                            throw "This script must be run as an Administrator."
+                        }
+
+                        # Import required module
+                        Import-Module -Name WebAdministration
+
+                        # Define the pattern to match the sites (wildcard pattern)
+                        \$sitePattern = "FINAPP-*_R4"
+
+                        # Get the environment variables from Jenkins
+                        \$companyNameEnv = "${companyNameEnv}"
+                        \$companyIdEnv = "${companyIdEnv}"
+                        \$domainEndpointEnv = "${domainEndpointEnv}"                        
+
+                        # Set environment variables for each matching IIS site
+                        Get-Website | Where-Object { \$_.Name -like \$sitePattern } | ForEach-Object {
+                            \$iisSiteName = \$_.Name
+
+                            # Environment variables to set
+                            \$envVars = @{
+                                "COMPANY_NAME_ENVIRONMENT" = \$companyNameEnv
+                                "COMPANY_ID_ENVIRONMENT" = \$companyIdEnv
+                                "DOMAIN_ENDPOINT_ENVIRONMENT" = \$domainEndpointEnv                                
+                            }
+
+                            # Set environment variables for the site
+                            foreach (\$envVar in \$envVars.Keys) {
+                                \$envVarValue = \$envVars[\$envVar]
+                                Write-Host "Setting environment variable \$envVar to \$envVarValue for site \$iisSiteName"
+
+                                # Check if the environment variable exists
+                                \$existingEnvVar = Get-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST/\$iisSiteName" -filter "system.webServer/aspNetCore/environmentVariables/add[@name='\$envVar']" -name "value" -ErrorAction SilentlyContinue
+
+                                if (\$existingEnvVar) {
+                                    # Update the existing environment variable
+                                    Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST/\$iisSiteName" -filter "system.webServer/aspNetCore/environmentVariables/add[@name='\$envVar']" -name "value" -value "\$envVarValue"
+                                } else {
+                                    # Create the environment variable if it does not exist
+                                    Add-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST/\$iisSiteName" -filter "system.webServer/aspNetCore/environmentVariables" -name "." -value @{name="\$envVar"; value="\$envVarValue"}
+                                }
+                            }
+
+                            # Start the IIS site
+                            Start-Website -Name \$iisSiteName
+                            Stop-WebAppPool -Name \$iisSiteName
+                            
+                            Write-Host "Website \$iisSiteName started"
+                        }
+                        """
+                    }
+                }
+            }
+        }      
+    }
+
+    post {
+        success {
+            echo 'Build, test, and publish successful!'
+        }
+    }
+}
